@@ -18,11 +18,10 @@ using Printf
 using Reexport
 using Revise
 using DomainSets
-
-
+using JLD2
 ###Utilities 
 function log_std_clip(x)
-    return minimum([-4,maximum([x,-4])])
+    return minimum([4,maximum([x,-4])])
 end
 clip(x,ϵ) = minimum([1+ϵ,maximum([x,1-ϵ])]) 
 g(ϵ,A) = (A>=0) ? (1+ϵ) * A : (1-ϵ) * A
@@ -36,7 +35,9 @@ struct ActorCriticPolicy
     value_network::Chain
 end
 
-
+function copy(𝒫::ActorCriticPolicy)
+    return ActorCriticPolicy(Flux.deepcopy(𝒫.feature_network),Flux.deepcopy(𝒫.mean_network),Flux.deepcopy(𝒫.std_network),Flux.deepcopy(𝒫.value_network))
+end    
 ###Apply policy to env
 function(𝒫::ActorCriticPolicy)(env::AbstractEnv; deterministic::Bool = false)
     state = Vector{Float32}(RLBase.state(env))
@@ -50,7 +51,7 @@ function(𝒫::ActorCriticPolicy)(env::AbstractEnv; deterministic::Bool = false)
 end
 
 ###Construct appropriate networks
-function ActorCriticPolicy(env::AbstractEnv;l::Vector{Int64}=[64,64])
+function ActorCriticPolicy(env::AbstractEnv;l::Vector{Int64}=[128,128])
     out_size = DomainSets.dimension(RLBase.action_space(env))
     in_size = DomainSets.dimension(RLBase.state_space(env))
 
@@ -74,7 +75,7 @@ function policy_log_prob(𝒫::ActorCriticPolicy,state::Vector{Float32},action::
 end
 
 ###Sample trajectories
-function sample_trajectory(𝒫::ActorCriticPolicy,env::AbstractEnv ;deterministic::Bool=false, kwargs...)
+function sample_trajectory(𝒫::ActorCriticPolicy,env::AbstractEnv;deterministic::Bool=false, kwargs...)
     RLBase.reset!(env)
     rewards = Vector{Float32}()
     actions = Vector{Vector{Float32}}()
@@ -86,7 +87,7 @@ function sample_trajectory(𝒫::ActorCriticPolicy,env::AbstractEnv ;determinist
         push!(rewards,deepcopy(RLBase.reward(env,action;kwargs...)))
         RLBase.act!(env,action) 
     end
-    rewards[end]+= RLBase.reward(env;kwargs...)
+    rewards[end]+= deepcopy(RLBase.reward(env,nothing;kwargs...))
     return rewards,actions,Vector{Vector{Float32}}(states)
 end
 
@@ -131,7 +132,7 @@ function PPO(env::AbstractEnv;
              n_steps::Int64 =2048,
              iterations::Int64=100,
              initial_policy::Union{ActorCriticPolicy,Nothing}=nothing,
-             l::Vector{Int64}=[64,64],
+             l::Vector{Int64}=[128,128],
              epochs::Int64 = 10, 
              η::Float32 = 1f-3,
              fit_batch_size::Int64=64,
@@ -140,15 +141,16 @@ function PPO(env::AbstractEnv;
              γ::Float32=Float32(0.99),
              λ::Float32=Float32(0.97),
              KL_targ::Union{Float32,Nothing}=5f-2,
-             clip_grad_tresh::Float32 = 5f-1,
+             clip_grad_tresh::Union{Float32} = 1f1,
              vf_ratio::Float32 = 5f-1,
              ent_ratio::Float32 = 0f0,
              norm_adv::Bool = true,
+             use_log_rewards::Bool = false,
+             stop_score::Union{Float32,Nothing}=nothing,
              trajectory_kwargs...)
 
-    𝒫 = isnothing(initial_policy) ? ActorCriticPolicy(env;l=l) : initial_policy
+    𝒫 = isnothing(initial_policy) ? ActorCriticPolicy(env;l=l) : copy(initial_policy)
     opt_state = Flux.setup(Flux.Optimiser(ClipValue(clip_grad_tresh), ADAM(η)), 𝒫)
-    n = DomainSets.dimension(RLBase.action_space(env))
     score_history = Vector{Float32}()
     for iter in 1:iterations
         rewards_to_go = Vector{Vector{Float32}}()
@@ -158,6 +160,9 @@ function PPO(env::AbstractEnv;
         scores = Vector{Float32}()
         while(length(rewards_to_go) < n_steps || length(scores)<trajectory_batch_size)
             rewards,acts,states = sample_trajectory(𝒫,env;trajectory_kwargs...)
+            if(use_log_rewards)
+                rewards = dB.(rewards)
+            end
             rtg,adv = GAE(states,rewards,acts,𝒫;γ=γ,λ=λ)
             push!(scores,sum(rewards))
             rewards_to_go = vcat(rewards_to_go,rtg)
@@ -166,15 +171,16 @@ function PPO(env::AbstractEnv;
             states_list=vcat(states_list,states)
             acts_list=vcat(acts_list,acts)
         end
+
         acts_list = Matrix{Float32}([acts_list[j][i] for i=1:size(acts_list[1])[1], j=1:size(acts_list)[1]])
         states_list = Matrix{Float32}([states_list[j][i] for i=1:size(states_list[1])[1], j=1:size(states_list)[1]])
-        rewards_to_go =  Matrix{Float32}(reshape(rewards_to_go,1,length(rewards_to_go)))
+        rewards_to_go =  Vector{Float32}(rewards_to_go)
         
-        Adv_list =  Matrix{Float32}(reshape(Adv_list,1,length(Adv_list)))
+        Adv_list =  Vector{Float32}(Adv_list)
         
 
         old_log_probs = reshape([policy_log_prob(𝒫,states_list[:,i],acts_list[:,i]) for i in 1:length(rewards_to_go)],size(Adv_list)...)
-        data = Flux.DataLoader((reduce(vcat,[rewards_to_go,Adv_list,old_log_probs]), vcat(states_list,acts_list)), batchsize=fit_batch_size, shuffle=true, partial=false)
+                data = Flux.DataLoader((rewards_to_go,Adv_list,old_log_probs, states_list,acts_list), batchsize=fit_batch_size, shuffle=true, partial=false)
 
         policy_losses = Vector{Float32}()
         value_losses = Vector{Float32}()
@@ -182,15 +188,9 @@ function PPO(env::AbstractEnv;
         entropy_losses = Vector{Float32}()
         KL_list = Vector{Float32}()
         for epoch in 1:epochs
-            for (x,y) in data
+            for (batch_rewards_to_go,batch_Adv,batch_old_log_probs,batch_states,batch_acts) in data
 
-              batch_rewards_to_go=x[1,:]
-              batch_Adv=x[2,:]
-              batch_old_log_probs=x[3,:]
-              batch_states = y[1:end-n,:]
-              batch_acts = y[end-n+1:end,:]
-                
-              p_loss,v_loss,entropy,clip_rat,new_log_probs,ratio =0f0,0f0,0f0,0f0,0f0,0f0
+                p_loss,v_loss,entropy,clip_rat,new_log_probs,ratio =0f0,0f0,0f0,0f0,0f0,0f0
               val, grads = Flux.withgradient(𝒫) do 𝒫
                   p_loss,v_loss,entropy,clip_rat = actor_critic_Loss(
                                     𝒫,
@@ -205,7 +205,6 @@ function PPO(env::AbstractEnv;
 
                  return vf_ratio * v_loss - p_loss - ent_ratio * entropy
               end
-
             push!(policy_losses,p_loss)
             push!(value_losses,v_loss)
             push!(clip_ratios,clip_rat)
@@ -218,13 +217,12 @@ function PPO(env::AbstractEnv;
             KL = mean((exp.(log_ratio).- 1).-log_ratio)
             push!(KL_list,KL)
 
-            if(!isnothing(KL_targ) && KL>KL_targ)
+            if(!isnothing(KL_targ) && KL>1.5 * KL_targ)
                 break
             end
         end
             
     end   
-        
         if(verbose)
             @printf "Iterations %i Complete\n" iter
             @printf "Updates %i\n" length(KL_list)
@@ -235,11 +233,65 @@ function PPO(env::AbstractEnv;
             @printf "Mean Policy Loss: %.5f\n" mean(policy_losses)
             @printf "Mean Value Loss: %.5f\n" mean(value_losses)
             @printf "Mean Entropy: %.5f\n" mean(entropy_losses)
+            @printf "Mean ADV: %.5f\n" mean(Adv_list)
             @printf "Mean Clip Ratio: %.5f\n" mean(clip_ratios)
             println("-------------------------")
             flush(stdout)
         end
         push!(score_history,mean(scores))
+
+        if(!isnothing(stop_score) && mean(scores) >= stop_score)
+            break
+        end
     end
     return 𝒫,score_history
 end
+
+
+function behavior_clone(𝒫::ActorCriticPolicy,expert_states::Vector{Vector{Float32}},expert_acts::Vector{Vector{Float32}};
+        batchsize::Int64 = 32,η::Float32 = 1f-3,tol::Float32 = 1f-6,epochs::Int64 = 1000
+)
+opt = Flux.setup(ADAM(η), 𝒫)
+Flux.freeze!(opt.std_network)
+data = Flux.DataLoader((expert_states,expert_acts),batchsize=batchsize)
+epoch_losses = Vector{Float32}()
+for epoch in 1:epochs
+    losses = Vector{Float32}()
+    for (x,y) in data
+        loss = 0f0
+        val, grads = Flux.withgradient(𝒫) do 𝒫
+         loss = mean(mean.([abs2.(x) for x in (𝒫.mean_network.(𝒫.feature_network.(x))-y)]))
+        end
+        push!(losses,loss)
+        Flux.update!(opt, 𝒫, grads[1])
+    end
+    push!(epoch_losses,mean(losses))
+    
+    if(epoch % 100 == 0)
+        @printf "Epoch %i\n" epoch
+        @printf "Loss: %.7f\n" epoch_losses[end]
+        flush(stdout)
+    end
+    if(epoch_losses[end]<tol)
+        @printf "Epoch %i\n" epoch
+        @printf "Loss: %.7f\n" epoch_losses[end]
+        break
+    end
+end
+
+end
+
+function save_policy(𝒫::ActorCriticPolicy,path::String)
+    model_state = Flux.state(𝒫);
+    jldsave(path;model_state)
+end
+
+function load_policy(𝒫::ActorCriticPolicy,path::String)
+    model_state = JLD2.load(path, "model_state");
+    Flux.loadmodel!(𝒫, model_state);
+end
+
+
+#dB(x)=-log(-x)
+α=1f-2
+dB(x)=log10(-x/α+α)/log10(α)
